@@ -1,0 +1,205 @@
+#PAKKER ======================================================================
+# install.packages(c("chromote", "jsonlite", "dplyr", "openxlsx", "logr"))
+library(chromote)
+library(jsonlite)
+library(dplyr)
+library(openxlsx)
+library(logr)
+
+#INDSTILLINGER ===============================================================
+kampagne_slug  <- "blackfriday"                                   # del af URL'en
+Power_url      <- paste0("https://www.power.dk/kampagne/", kampagne_slug, "/all/")
+output_mappe   <- "power_output"       # her lægges Excel-filerne
+historik_mappe <- "power_historik"     # her gemmes hver kørsel som .rds
+pause_ms        <- 500                 # pause mellem kald (vær høflig mod serveren)
+
+dir.create(output_mappe,   showWarnings = FALSE)
+dir.create(historik_mappe, showWarnings = FALSE)
+tidspunkt <- Sys.time()
+tidsstempel <- format(tidspunkt, "%Y-%m-%d_%H%M")
+
+#START LOG OG BROWSER ========================================================
+log_open(file_name = "power_log")
+log_print(paste("Start:", tidspunkt))
+
+options(chromote.headless = FALSE)       # sæt til TRUE hvis browseren ikke skal vises
+browsersession_power <- ChromoteSession$new()
+
+# Vent til siden er indlæst, så fetch() kører fra power.dk's eget domæne
+side_indlaest <- browsersession_power$Page$loadEventFired(wait_ = FALSE)
+browsersession_power$Page$navigate(Power_url, wait_ = FALSE)
+browsersession_power$wait_for(side_indlaest)
+Sys.sleep(2)
+
+#JAVASCRIPT DER HENTER ALLE SIDER FRA API'ET =================================
+# Returnerer én JSON-tekst med kampagne-ID, totalantal og alle produkter.
+js_hent_alle <- r"(
+(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // 1) Find kampagne-ID dynamisk (ændrer sig fra kampagne til kampagne / år til år)
+  const route = await fetch('/api/new-spa-route/kampagne/__SLUG__/').then(r => r.json());
+  const cmp = route.model.campaign.campaignId;
+
+  // 2) Ordbog til at oversætte lagerkoder som "Product.Stock.aLotLeft" til dansk
+  let dict = {};
+  try { dict = (await fetch('/api/v2/dictionary/new').then(r => r.json())).dictionary || {}; } catch (e) {}
+
+  // 3) Hent alle produkter i kampagnen i ét kald
+  const x = await fetch(`/api/v2/productlists?cmp=${cmp}&size=10000`).then(r => r.json());
+  const all   = x.products;
+  const total = x.totalProductCount;
+
+  // 4) Gør hvert produkt fladt (én række pr. produkt, null hvis feltet mangler)
+  const v = z => (z === undefined ? null : z);
+  const rows = all.map(p => {
+    const bc = (p.breadcrumb || []).map(b => b.name);   // fra smal -> bred kategori
+    return {
+      productId: v(p.productId),
+      manufacturerName: v(p.manufacturerName),
+      title: v(p.title),
+      categoryName: v(p.categoryName),
+      price: v(p.price),
+      previousPrice: v(p.previousPrice),
+      stockCount: v(p.stockCount),
+      storesStockCount: v(p.storesStockCount),
+      clickNCollectStoreCount: v(p.clickNCollectStoreCount),
+      // Lagerteksten oversat til dansk via ordbogen (fx "20+ på lager online")
+      webStockText: p.webStockTextShort ? v(dict[p.webStockTextShort] ?? p.webStockTextShort) : null,
+      canAddToCart: v(p.canAddToCart),
+      isLimitedQuantity: v(p.isLimitedQuantity),          // bruges kun internt i Overblik
+      stockLimitedRemaining: v(p.stockLimitedRemaining),
+      url: v(p.url),
+      kategori_niveau1: bc.length >= 1 ? bc[bc.length - 1] : null,
+      kategori_niveau2: bc.length >= 2 ? bc[bc.length - 2] : null,
+      kategori_sti: bc.slice().reverse().join(' > ')
+    };
+  });
+  // 5) Hent EAN og "Begrænset antal xxx stk." fra hvert produkts side-API
+  //    (5 produkter ad gangen). Ingen af delene findes i produktlisten.
+  //    - EAN:   model.extendedProduct.barcode
+  //    - Badge "Begrænset antal xxx stk." kan komme to steder fra:
+  //      a) limitedQuantityStockText: vises når isLimitedQuantity er sand
+  //         (tilbud med kvote, se stockLimitedRemaining).
+  //      b) maxPerCustomerText: et kampagnebadge, som vises mens perioden
+  //         maxPerCustomerFrom-maxPerCustomerTo er aktiv.
+const batch = 5;
+  const nu = new Date();
+  for (let i = 0; i < rows.length; i += batch) {
+    const chunk = rows.slice(i, i + batch);
+    await Promise.all(chunk.map(async r => {
+      try {
+        const j = await fetch('/api/new-spa-route' + r.url).then(res => res.json());
+        const e = j?.model?.extendedProduct || {};
+        r.EAN = e.barcode ?? null;
+
+        const mpcAktiv = !!e.maxPerCustomerText &&
+          (!e.maxPerCustomerFrom || new Date(e.maxPerCustomerFrom) <= nu) &&
+          (!e.maxPerCustomerTo   || new Date(e.maxPerCustomerTo)   >= nu);
+        let badge = null;
+        if (r.isLimitedQuantity && e.limitedQuantityStockText) {
+          badge = e.limitedQuantityStockText;
+        } else if (mpcAktiv && /^Begrænset antal\s*\d/i.test(e.maxPerCustomerText)) {
+          badge = e.maxPerCustomerText;
+        }
+        r.begraenset_antal_tekst = badge;
+      } catch (e) { r.EAN = null; r.begraenset_antal_tekst = null; }
+    }));
+    await sleep(__PAUSE__);
+  }
+
+  return JSON.stringify({ campaignId: cmp, totalProductCount: total, products: rows });
+})()
+)"
+
+js_hent_alle <- js_hent_alle |>
+  sub("__SLUG__",  kampagne_slug,   x = _, fixed = TRUE) |>
+  gsub("__PAUSE__", pause_ms,       x = _, fixed = TRUE)   # gsub: __PAUSE__ står 2 steder
+
+#HENT DATA ===================================================================
+svar <- browsersession_power$Runtime$evaluate(
+  js_hent_alle,
+  awaitPromise  = TRUE,
+  returnByValue = TRUE,
+  timeout_      = 1200         # sekunder – EAN-opslag pr. produkt tager et par minutter
+)
+
+if (!is.null(svar$exceptionDetails)) {
+  log_print(svar$exceptionDetails)
+  stop("JavaScript-fejl under hentning – se loggen.")
+}
+
+#PARSE JSON TIL DATAFRAME ====================================================
+# Funktionen er adskilt, så den også kan testes uden browser.
+parse_power_json <- function(json_tekst) {
+  raa <- fromJSON(json_tekst, simplifyDataFrame = TRUE)
+  df  <- as.data.frame(raa$products, check.names = FALSE)
+  attr(df, "campaignId")        <- raa$campaignId
+  attr(df, "totalProductCount") <- raa$totalProductCount
+  df
+}
+
+power_df <- parse_power_json(svar$result$value)
+total_power <- attr(power_df, "totalProductCount")   # gemmes før dplyr fjerner attributterne
+log_print(paste0("Kampagne-ID: ", attr(power_df, "campaignId"),
+                 " | Hentet: ", nrow(power_df),
+                 " | Power angiver i alt: ", attr(power_df, "totalProductCount")))
+
+#KATEGORISERING (MDA / CE / SDA / TELECOM / COMPUTING) =======================
+kategoriser_power <- function(df) {
+  df |>
+    mutate(Produktkategori = case_when(
+      # --- Undtagelser først ---------------------------------------------
+      # Kameraer (også under "Mobil og foto") og overvågningskameraer -> CE
+      kategori_niveau2 %in% c("Kameraer", "Kameratilbehør") |
+        categoryName == "Overvågningskameraer"                       ~ "CE",
+      # Alt med hovedtelefoner/højtalere (fx også under "Computere og tablets") -> CE
+      grepl("Hovedtelefoner|Højtalere", kategori_sti)                 ~ "CE",
+      # Tablets og tablettilbehør -> Telecom
+      kategori_niveau2 == "Tablets og tilbehør"                       ~ "Telecom",
+      # Ovne er MDA, også pizzaovne under "Hus og outdoor"
+      grepl("ovn", categoryName, ignore.case = TRUE) &
+        !grepl("mikroovn", categoryName, ignore.case = TRUE) &
+        kategori_niveau1 != "Hvidevarer"                              ~ "MDA",
+      # El-løbehjul og andre personlige transportmidler -> SDA
+      grepl("løbehjul|Elcykel|Elcykler|Transport", kategori_sti,
+            ignore.case = TRUE)                                       ~ "SDA",
+      
+      # --- Hovedregler efter Powers øverste kategori ----------------------
+      kategori_niveau1 == "Hvidevarer"                                ~ "MDA",
+      kategori_niveau1 == "Smart Home"                                ~ "MDA",  # Philips Hue m.m.
+      kategori_niveau1 == "TV og lyd"                                 ~ "CE",
+      kategori_niveau1 %in% c("Køkken og madlavning",
+                              "Skønhed og velvære",
+                              "Hus og outdoor")                       ~ "SDA",
+      kategori_niveau1 == "Mobil og foto"                             ~ "Telecom",
+      kategori_niveau1 %in% c("Computere og tablets",
+                              "Gaming og underholdning")              ~ "Computing",
+      TRUE                                                            ~ "Ukendt – tjek"
+    ))
+}
+
+#KLARGØR ENDELIG TABEL =======================================================
+power_df <- power_df |>
+  distinct(productId, .keep_all = TRUE) |>
+  kategoriser_power() |>
+  mutate(
+    url        = paste0("https://www.power.dk", url),
+    rabat_kr   = previousPrice - price,
+    rabat_pct  = ifelse(!is.na(previousPrice) & previousPrice > 0,
+                        (previousPrice - price) / previousPrice, NA_real_),
+    hentet     = format(tidspunkt, "%Y-%m-%d %H:%M"),
+    # Tallet fra badget "Begrænset antal 2000 stk." -> 2000 (NA hvis intet badge)
+    begraenset_antal_vist = suppressWarnings(as.numeric(gsub("\\.", "",
+                                                             sub("^\\D*(\\d[0-9.]*).*$", "\\1", begraenset_antal_tekst))))
+  ) |>
+  select(
+    Produktkategori,
+    EAN, manufacturerName, title, categoryName,
+    price, previousPrice, rabat_kr, rabat_pct,
+    stockCount, storesStockCount, clickNCollectStoreCount,
+    webStockText, canAddToCart, stockLimitedRemaining, begraenset_antal_vist,
+    url, hentet  ) |>
+  arrange(Produktkategori, desc(rabat_pct))
+
+power_df
