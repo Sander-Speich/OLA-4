@@ -1,0 +1,112 @@
+# Opgave 3.5 
+
+library(jsonlite)
+library(httr)
+library(stringr)
+library(logr)
+library(emayili)
+source("util.R")
+
+# Initialiser logning
+log_open(file_name = "overvaag")
+log_print("Overvågning af Nordsøen startet")
+
+baseurl <- "https://opensky-network.org/api"
+endpointS <- "/states/all"
+endpointT <- "/tracks/all"
+
+#### NORTH SEA ####
+lamin=52.055129
+lamax=56.196869
+lomin=-6.065140
+lomax=4.305954
+fullurl=paste0(baseurl,endpointS,"?lamin=",lamin,"&lomin=",lomin,"&lamax=",lamax,"&lomax=",lomax)
+
+colnv=c("icao24","callsign","startTime","endTime","time","lat","lng","alt","crs","grd")
+
+# Indstillinger (som i Wulfs collData.R og noterne)
+freq=900          # pause mellem hver runde i sekunder (900 = 15 minutter)
+counter=0         # tæller hvor mange runder vi har kørt
+limit=1           # hvor mange runder der skal køres (1 til testen)
+condition=TRUE    # loopet kører, så længe condition er TRUE
+token=getToken()  # log ind hos OpenSky
+
+while (condition) {
+  counter=counter+1
+  log_print(str_c("Runde ", counter))
+  
+  # Hent fly over Nordsøen                          <- chunk 5 starter her
+  res <- tryCatch(
+    httr::GET(fullurl, add_headers(Authorization = paste("Bearer", token))),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(res) && res$status_code == 200) {
+    statedfpr <- as.data.frame(fromJSON(content(res, as="text"))$states)
+    icaov=statedfpr$V1
+    log_print(str_c(length(icaov), " fly over Nordsøen"))
+    
+    # Tjek hvert fly med vores algoritme fra 3.4
+    mistaenkte=c()
+    for (ic in icaov) {
+      turl=paste0(baseurl,endpointT,"?icao24=",ic,"&time=0")
+      res2 <- tryCatch(
+        httr::GET(turl, add_headers(Authorization = paste("Bearer", token))),
+        error = function(e) NULL
+      )
+      if (!is.null(res2) && res2$status_code == 401) {
+        token=getToken()
+      }
+      if (!is.null(res2) && res2$status_code == 200) {
+        trackdf <- as.data.frame(fromJSON(content(res2, as="text", encoding="UTF-8")))
+        if (ncol(trackdf) == 10) {
+          colnames(trackdf)=colnv
+          dcrs=diff(trackdf$crs)
+          dcrs=(dcrs + 180) %% 360 - 180
+          vend=cumsum(dcrs)
+          drej=max(vend, na.rm=TRUE) - min(vend, na.rm=TRUE)
+          if (drej >= 360) {
+            mistaenkte=c(mistaenkte, ic)
+          }
+        }
+      }
+      Sys.sleep(1)
+    }
+    log_print(str_c(length(mistaenkte), " mistænkelige fly fundet"))
+    
+    # Gem listen over mistænkelige fly i en fil          
+    filename=str_c("mistaenkte_", format(Sys.time(), "%Y%m%d_%H%M"), ".csv")
+    write.csv(data.frame(icao=mistaenkte), filename, row.names=FALSE)
+    log_print(str_c("Listen er gemt i ", filename))
+    log_print(mistaenkte) 
+    
+    # Send listen på mail
+    email <- envelope() |>
+      from("Albertemalm@gmail.com") |>
+      to("Albertemalm@gmail.com") |>    # test: jeres egen mail. Rigtigt: "sigint-20@fe.dk"
+      subject(str_c("Mistænkelige fly over Nordsøen ", format(Sys.time(), "%d-%m-%Y %H:%M"))) |>
+      text(str_c(length(mistaenkte), " fly har drejet mindst en hel omgang. Se vedhæftet liste.")) |>
+      attachment(filename)
+    
+    smtp <- server(host="smtp.gmail.com", port=465,
+                   username="Albertemalm@gmail.com", password="tdurumqcvkbesqxf")
+    
+    tryCatch({
+      smtp(email)
+      log_print("Mail sendt")
+    }, error = function(e) log_print("Mail kunne ikke sendes"))
+    
+  } else {
+    log_print("Fejl ved hentning – henter nyt token")
+    token=getToken()
+  }                    
+  
+  if (counter >= limit) {
+    condition=FALSE
+    log_print("finished")
+  } else {
+    Sys.sleep(freq)
+  }
+}
+
+log_close()
