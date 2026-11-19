@@ -1,0 +1,613 @@
+# ==========================================
+# API - UGE 45
+# FLYDATA OG CIRCLING DETECTION
+# OPGAVE 3.1, 3.2 OG 3.3
+# ==========================================
+
+# Opgave 1 
+
+# 1. INDLÆS PAKKER --------------------------
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(jsonlite)
+library(ggplot2)
+library(httr)
+library(leaflet)
+
+source("util.R")
+
+
+# 2. OPENSKY API ----------------------------
+
+baseurl <- "https://opensky-network.org/api"
+
+endpoint <- "/states/all"
+endpointTrack <- "/tracks/all"
+
+toturl <- str_c(baseurl, endpoint)
+
+token <- getToken()
+
+if (is.null(token)) {
+  stop("Kunne ikke hente token")
+}
+
+
+# 3. NORTH SEA BOUNDING BOX -----------------
+
+lamin <- 52.055129
+lamax <- 56.196869
+lomin <- -6.065140
+lomax <- 4.305954
+
+toturl <- paste0(
+  baseurl, endpoint,
+  "?lamin=", lamin,
+  "&lomin=", lomin,
+  "&lamax=", lamax,
+  "&lomax=", lomax
+)
+
+
+# 4. HENT FRISKE FLY ------------------------
+
+test1 <- httr::GET(
+  toturl,
+  add_headers(
+    Authorization = paste("Bearer", token)
+  ),
+  timeout(30)
+)
+
+print(test1$status_code)
+
+stop_for_status(test1)
+
+rawtext <- httr::content(test1, as = "text")
+
+myJason <- jsonlite::fromJSON(rawtext)
+
+dfFlights <- as.data.frame(myJason$states)
+
+if (nrow(dfFlights) == 0) {
+  stop("Ingen fly fundet i Nordsøen")
+}
+
+
+# 5. NAVNGIV VARIABLER ----------------------
+
+names <- c(
+  "icao24",
+  "callsign",
+  "origin_country",
+  "time_position",
+  "last_contact",
+  "longitude",
+  "latitude",
+  "baro_altitude",
+  "on_ground",
+  "velocity",
+  "true_track",
+  "vertical_rate",
+  "sensors",
+  "geo_altitude",
+  "squawk",
+  "spi",
+  "position_source"
+)
+
+colnames(dfFlights) <- names
+
+# Se alle fly
+View(dfFlights)
+
+# Antal fly
+nrow(dfFlights)
+
+# Gem flydata
+saveRDS(dfFlights, "dfFlights.rds")
+
+
+# ==========================================
+# OPGAVE 3.1 - BARPLOT
+# ==========================================
+
+# Antal fly fordelt på registreringslande
+
+countryCount <- dfFlights %>%
+  count(origin_country, name = "antal") %>%
+  arrange(desc(antal))
+
+View(countryCount)
+
+ggplot(
+  countryCount,
+  aes(
+    x = reorder(origin_country, antal),
+    y = antal
+  )
+) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Fly over Nordsøen fordelt på lande",
+    x = "Registreringsland",
+    y = "Antal fly"
+  ) +
+  theme_minimal()
+
+#Bedre og flottere plot 
+
+# --- Data til plottet ---
+total <- nrow(dfFlights)
+
+hentetid <- format(
+  as.POSIXct(max(as.numeric(dfFlights$last_contact)),
+             origin = "1970-01-01", tz = "Europe/Copenhagen"),
+  "%d.%m.%Y kl. %H:%M"
+)
+
+plotdata <- dfFlights %>%
+  count(origin_country, name = "antal") %>%
+  slice_max(antal, n = 10, with_ties = FALSE) %>%
+  mutate(
+    tekst = paste0(antal, "  (", round(antal / total * 100), " %)"),
+    fremhaev = origin_country == "United Kingdom",
+    origin_country = reorder(origin_country, antal)
+  )
+
+# --- Plottet ---
+ggplot(plotdata, aes(x = antal, y = origin_country, fill = fremhaev)) +
+  geom_col(width = 0.72) +
+  geom_text(aes(label = tekst), hjust = -0.1, size = 4.2, colour = "grey20") +
+  scale_fill_manual(values = c(`TRUE` = "#1F5A96", `FALSE` = "#B8C4D1"), guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.25))) +
+  labs(
+    title = "Over halvdelen af flyene over Nordsøen er britiske",
+    subtitle = paste0("Top 10 registreringslande blandt ", total, " fly · hentet ", hentetid),
+    caption = "Kilde: OpenSky Network · Land = hvor flyet er registreret",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(colour = "grey40", margin = margin(b = 12)),
+    plot.caption = element_text(colour = "grey50", size = 10),
+    plot.title.position = "plot",
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(colour = "grey20"),
+    panel.grid = element_blank(),
+    plot.margin = margin(15, 20, 15, 15)
+  )
+
+# --- Gem i høj kvalitet ---
+ggsave("barplot_3_1.png", width = 10, height = 6, dpi = 300, bg = "white")
+
+
+# ==========================================
+# OPGAVE 3.2 - START SMALL
+# ==========================================
+
+# Funktion til at hente track for ét fly
+
+getFlightTrack <- function(icaoId, token) {
+  
+  totUrl <- paste0(
+    baseurl,
+    endpointTrack,
+    "?icao24=", icaoId,
+    "&time=0"
+  )
+  
+  test2 <- tryCatch(
+    httr::GET(
+      totUrl,
+      add_headers(
+        Authorization = paste("Bearer", token)
+      ),
+      timeout(30)
+    ),
+    error = function(e) NULL
+  )
+  
+  if (is.null(test2)) {
+    return(NULL)
+  }
+  
+  if (test2$status_code != 200) {
+    message(
+      "Fly ", icaoId,
+      " - status: ", test2$status_code
+    )
+    return(NULL)
+  }
+  
+  rawtext2 <- httr::content(
+    test2, as = "text"
+  )
+  
+  myJason2 <- jsonlite::fromJSON(rawtext2)
+  
+  if (is.null(myJason2$path)) {
+    return(NULL)
+  }
+  
+  dfFlights2 <- as.data.frame(
+    myJason2$path
+  )
+  
+  if (nrow(dfFlights2) == 0 ||
+      ncol(dfFlights2) != 6) {
+    return(NULL)
+  }
+  
+  df2Names <- c(
+    "time",
+    "latitude",
+    "longitude",
+    "baro_altitude",
+    "true_track",
+    "on_ground"
+  )
+  
+  colnames(dfFlights2) <- df2Names
+  
+  for (v in c(
+    "time", "latitude", "longitude",
+    "baro_altitude", "true_track"
+  )) {
+    dfFlights2[[v]] <- as.numeric(
+      dfFlights2[[v]]
+    )
+  }
+  
+  return(dfFlights2)
+}
+
+
+# Find ICAO24-numre
+
+icaov <- dfFlights$icao24
+
+
+# Start med ét fly
+# Prøv de første 10, indtil et track findes
+
+token <- getToken()
+
+dfFlights2 <- NULL
+
+for (i in seq_len(min(10, length(icaov)))) {
+  
+  icaoId <- icaov[i]
+  
+  dfFlights2 <- getFlightTrack(
+    icaoId, token
+  )
+  
+  if (!is.null(dfFlights2)) {
+    cat("Track fundet for:", icaoId, "\n")
+    break
+  }
+  
+  Sys.sleep(2)
+}
+
+
+# Se og plot flyets track
+
+if (!is.null(dfFlights2)) {
+  
+  View(dfFlights2)
+  
+  par(mfrow = c(2, 3))
+  
+  plot(
+    dfFlights2$longitude,
+    dfFlights2$latitude,
+    type = "l",
+    main = "Flyets rute",
+    xlab = "Longitude",
+    ylab = "Latitude"
+  )
+  
+  plot(
+    dfFlights2$time,
+    dfFlights2$baro_altitude,
+    type = "l",
+    main = "Flyets højde",
+    xlab = "Tid",
+    ylab = "Højde"
+  )
+  
+  plot(
+    dfFlights2$time,
+    dfFlights2$true_track,
+    type = "l",
+    main = "Flyets kurs",
+    xlab = "Tid",
+    ylab = "Kurs"
+  )
+  
+} else {
+  message("Ingen tilgængelige tracks blandt de første 10 fly")
+}
+
+
+# 6. INDLÆS CIRKLENDE TRÆNINGSFLY -----------
+
+fl <- list.files(
+  path = "./train",
+  pattern = "\\.rds$",
+  full.names = TRUE
+)
+
+collist <- lapply(fl, readRDS)
+
+length(collist)
+
+# Brug cirkelfly fra underviseren
+
+testdf <- readRDS("train/circMT.rds")
+
+View(testdf)
+
+
+# 7. GRAFER FOR CIRKLENDE FLY ---------------
+
+plot(
+  testdf$lng,
+  testdf$lat,
+  type = "l",
+  main = "Cirklende fly - rute",
+  xlab = "Longitude",
+  ylab = "Latitude"
+)
+
+plot(
+  testdf$time,
+  testdf$alt,
+  type = "l",
+  main = "Cirklende fly - højde",
+  xlab = "Tid",
+  ylab = "Højde"
+)
+
+plot(
+  testdf$time,
+  testdf$crs,
+  type = "l",
+  main = "Cirklende fly - kurs",
+  xlab = "Tid",
+  ylab = "Kurs"
+)
+
+par(mfrow = c(1, 1))
+
+
+# 8. VIS CIRKLENDE FLY PÅ KORT -------------
+
+myMapPlot <- function(df) {
+  
+  df <- df[
+    !is.na(df$lat) & !is.na(df$lng),
+  ]
+  
+  leaflet(df) %>%
+    addTiles() %>%
+    addPolylines(
+      lat = ~lat,
+      lng = ~lng
+    )
+}
+
+myMapPlot(testdf)
+
+# ==========================================
+# 3.2 - SAMMENLIGNING FORKLARET I PLOTTET
+# ==========================================
+
+library(maps)
+
+par(bg = "white")   # hvid baggrund
+
+tid1 <- (dfFlights2$time - min(dfFlights2$time)) / 60
+tid2 <- (testdf$time - min(testdf$time)) / 60
+
+kompas      <- c(0, 90, 180, 270, 360)
+kompasNavne <- c("Nord", "Øst", "Syd", "Vest", "Nord")
+
+par(mfrow = c(2, 3), oma = c(2, 0, 4, 0), mar = c(4, 4, 2.5, 1))
+
+# --- Øverste række: fly fra England (blå) ---
+
+plot(NA, xlim = c(-6, 16), ylim = c(45, 56), asp = 1.5,
+     axes = FALSE, xlab = "", ylab = "", main = "Rute")
+rect(-180, -90, 180, 90, col = "lightblue1", border = NA)
+map("world", add = TRUE, fill = TRUE, col = "grey90", border = "grey60")
+lines(dfFlights2$longitude, dfFlights2$latitude, lwd = 3, col = "steelblue")
+points(dfFlights2$longitude[1], dfFlights2$latitude[1], pch = 16, cex = 1.5)
+text(dfFlights2$longitude[1], dfFlights2$latitude[1], "Start", pos = 3, cex = 0.8)
+text(2, 47, "Flyet flyver ligeud\nmod sit mål", cex = 0.8)
+box()
+
+plot(tid1, dfFlights2$baro_altitude, type = "l", lwd = 2, col = "steelblue", xlim = c(0, 100),
+     main = "Højde over tid", xlab = "Minutter", ylab = "Højde (m)")
+
+plot(tid1, dfFlights2$true_track, type = "l", lwd = 2, col = "steelblue",
+     xlim = c(0, 100), ylim = c(0, 360), yaxt = "n",
+     main = "Retning over tid", xlab = "Minutter", ylab = "")
+axis(2, at = kompas, labels = kompasNavne, las = 1)
+text(50, 250, "Peger samme vej\nhele turen", cex = 0.9)
+
+# --- Nederste række: cirklende fly (rød) ---
+
+plot(NA, xlim = c(23, 34), ylim = c(33.5, 36), asp = 1.2,
+     axes = FALSE, xlab = "", ylab = "", main = "Rute")
+rect(-180, -90, 180, 90, col = "lightblue1", border = NA)
+map("world", add = TRUE, fill = TRUE, col = "grey90", border = "grey60")
+lines(testdf$lng, testdf$lat, lwd = 3, col = "firebrick")
+points(testdf$lng[1], testdf$lat[1], pch = 16, cex = 1.5)
+text(testdf$lng[1], testdf$lat[1], "Start", pos = 3, cex = 0.8)
+arrows(30.1, 34.05, 30.2, 34.55, length = 0.1, lwd = 2)
+text(30, 33.8, "Flyet cirkler her, før det\nfortsætter mod vest", cex = 0.8)
+box()
+
+plot(tid2, testdf$alt, type = "l", lwd = 2, col = "firebrick", xlim = c(0, 100),
+     main = "Højde over tid", xlab = "Minutter", ylab = "Højde (m)")
+
+plot(tid2, testdf$crs, type = "l", lwd = 2, col = "firebrick",
+     xlim = c(0, 100), ylim = c(0, 360), yaxt = "n",
+     main = "Retning over tid", xlab = "Minutter", ylab = "")
+axis(2, at = kompas, labels = kompasNavne, las = 1)
+rect(19, 0, 33, 360, col = adjustcolor("firebrick", 0.15), border = NA)
+text(65, 150, "Drejer 2 hele\nomgange rundt", cex = 0.9)
+
+# --- Samlet overskrift og forklaring ---
+mtext("Fly fra England (blå) vs. cirklende fly (rød)", outer = TRUE, line = 2, font = 2, cex = 1.3)
+mtext("Rute og højde ligner hinanden – men retningen afslører, at det røde fly drejer rundt",
+      outer = TRUE, line = 0.5)
+mtext("De lodrette røde streger er ikke rigtige drej: kompasset starter bare forfra, når flyet passerer nord",
+      side = 1, outer = TRUE, line = 0.5, cex = 0.8)
+
+par(mfrow = c(1, 1), oma = c(0, 0, 0, 0), mar = c(5, 4, 4, 2))
+
+# ==========================================
+# OPGAVE 3.3 - MOVE FAST
+# LOOP GENNEM ALLE FLY
+# ==========================================
+
+# 1. Frisk liste af fly over Nordsøen
+token=getToken()
+res <- httr::GET(toturl, add_headers(Authorization = paste("Bearer", token)))
+resretval <- jsonlite::fromJSON(httr::content(res, as="text", encoding="UTF-8"))
+statedfpr <- as.data.frame(resretval$states)
+icaov=statedfpr$V1
+length(icaov)
+
+
+# 2. Loop gennem alle fly
+colnv=c("icao24","callsign","startTime","endTime","time","lat","lng","alt","crs","grd")
+tracklist=list()
+resdf=data.frame()
+
+for (ic in icaov) {
+  turl=paste0(baseurl,endpointTrack,"?icao24=",ic,"&time=0")
+  res <- httr::GET(turl, add_headers(Authorization = paste("Bearer", token)))
+  if (res$status_code == 401) {
+    token=getToken()
+  }
+  if (res$status_code == 200) {
+    resretval <- fromJSON(content(res, as="text", encoding="UTF-8"))
+    trackdf <- as.data.frame(resretval)
+    if (ncol(trackdf) == 10) {
+      colnames(trackdf)=colnv
+      dcrs=diff(trackdf$crs)
+      dcrs=(dcrs + 180) %% 360 - 180
+      trackdf$dcrs=c(0,dcrs)
+      tracklist[[ic]]=trackdf
+      resdf=rbind(resdf, data.frame(icao=ic, sdcourse=sd(dcrs, na.rm=TRUE),
+                                    lmres=0, myOwnAlg=0, isOff=0))
+    }
+  }
+  Sys.sleep(1)
+}
+
+
+# 3. Lærerens cirklende fly
+resdf=resdf[resdf$isOff==0, ]   # fjern evt. gamle cirklende fly, så de ikke kommer med to gange
+
+fl=list.files(path="./train", pattern="\\.rds$", full.names=TRUE)
+fl=fl[!grepl("norm", fl)]       # det normale fly skal ikke med
+
+for (f in fl) {
+  df=readRDS(f)
+  dcrs=diff(df$crs)
+  dcrs=(dcrs + 180) %% 360 - 180
+  resdf=rbind(resdf, data.frame(icao=df$icao24[1], sdcourse=sd(dcrs, na.rm=TRUE),
+                                lmres=0, myOwnAlg=0, isOff=1))
+}
+
+
+# 4. Se og gem resultatet
+table(resdf$isOff)
+View(resdf)
+saveRDS(tracklist,"mytracks.rds")
+saveRDS(resdf,"resdf.rds")
+
+# Billede: før og efter rettelsen af kursen
+cirkel=readRDS("./train/circMT.rds")
+tid=(cirkel$time - min(cirkel$time)) / 60
+dcrs=diff(cirkel$crs)
+dcrs=(dcrs + 180) %% 360 - 180
+
+par(mfrow=c(1,2), oma=c(0,0,3,0), mar=c(5,8,4,1))
+
+# Venstre: rå kurs
+plot(tid, cirkel$crs, type="l", lwd=2, col="grey30", ylim=c(0,360), yaxt="n",
+     main="Før: flyets kurs", xlab="Tid (minutter fra flyets start)", ylab="")
+axis(2, at=c(0,90,180,270,360), labels=c("Nord","Øst","Syd","Vest","Nord"), las=1)
+mtext("Flyets retning", side=2, line=5)
+rect(19.5, 0, 33.5, 360, col=adjustcolor("firebrick", 0.15), border=NA)
+text(55, 150, "De lodrette streger er ikke\nrigtige drej – kursen springer\nbare fra 0 til 360, når\nflyet passerer nord", cex=0.8)
+
+# Højre: rettet kursændring
+plot(tid[-1], dcrs, type="l", lwd=2, col="firebrick", ylim=c(-15,15), yaxt="n",
+     main="Efter: hvor meget flyet drejer", xlab="Tid (minutter fra flyets start)", ylab="")
+axis(2, at=c(-10,0,10), labels=c("10° venstre","Ligeud","10° højre"), las=1)
+mtext("Drej mellem to målinger", side=2, line=6)
+abline(h=0, lty=2, col="grey50")
+rect(19.5, -15, 33.5, 15, col=adjustcolor("firebrick", 0.15), border=NA)
+text(55, -10, "Rødt felt: flyet drejer\nhele tiden til venstre\n= det cirkler", cex=0.8)
+
+mtext("Hvorfor vi retter kursen – lærerens cirklende fly (circMT)", outer=TRUE, line=1, font=2, cex=1.2)
+par(mfrow=c(1,1), oma=c(0,0,0,0), mar=c(5,4,4,2))
+
+# ==========================================
+# OPGAVE 3.4 - AIM HIGH - EGEN ALGORITME
+# ==========================================
+
+lmresv=c()
+drejv=c()
+
+# 1. Jeres egne fly
+for (df in tracklist) {
+  model=lm(lat ~ lng, data=df)
+  lmresv=c(lmresv, summary(model)$r.squared)
+  
+  vend=cumsum(df$dcrs)
+  drejv=c(drejv, max(vend, na.rm=TRUE) - min(vend, na.rm=TRUE))
+}
+
+# 2. Lærerens cirklende fly
+for (f in fl) {
+  df=readRDS(f)
+  model=lm(lat ~ lng, data=df)
+  lmresv=c(lmresv, summary(model)$r.squared)
+  
+  dcrs=diff(df$crs)
+  dcrs=(dcrs + 180) %% 360 - 180
+  vend=cumsum(dcrs)
+  drejv=c(drejv, max(vend, na.rm=TRUE) - min(vend, na.rm=TRUE))
+}
+
+# 3. Sæt resultaterne ind i tabellen
+length(lmresv)
+nrow(resdf)
+
+resdf$lmres=lmresv
+resdf$myOwnAlg=ifelse(drejv >= 360, 1, 0)
+
+# 4. Hvor godt gætter algoritmen?
+table(Algoritme=resdf$myOwnAlg, Facit=resdf$isOff)
+View(resdf)
+View(rbind(head(resdf, 10), tail(resdf, 9)))   # udsnit til rapporten (billede 3)
+saveRDS(resdf,"resdf.rds")
+
+# 5. Kig på de fly, algoritmen mener cirkler
+resdf[resdf$myOwnAlg==1 & resdf$isOff==0, ]
+
+myMapPlot(tracklist[["a8320e"]])
+myMapPlot(tracklist[["484fde"]])
